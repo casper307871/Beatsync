@@ -1,0 +1,8 @@
+webrtc-dj/
+├─ package.json
+├─ server.js                  # WebSocket signaling + static hosting
+└─ public/
+   ├─ broadcaster.html        # DJ page (select audio device, go live)
+   ├─ viewer.html             # Listener mini app (works in Telegram)
+   ├─ viewer.js               # WebRTC + EQ logic for listeners
+   └─ style.css
