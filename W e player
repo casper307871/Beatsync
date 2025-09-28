@@ -1,0 +1,58 @@
+<body>
+  <h1>🎶 Live DJ Stream</h1>
+  <video id="player" autoplay></video>
+
+  <div>
+    <label>Volume:</label>
+    <input type="range" min="0" max="1" step="0.01" value="1" id="volume">
+  </div>
+
+  <div>
+    <label>EQ Preset:</label>
+    <select id="preset">
+      <option value="flat">Flat</option>
+      <option value="pop">Pop</option>
+      <option value="rock">Rock</option>
+      <option value="voice">Voice</option>
+      <option value="hiphop">Hip-Hop</option>
+      <option value="techno">Techno</option>
+      <option value="dubstep">Dubstep</option>
+      <option value="bass">Bass Boost</option>
+      <option value="treble">Treble Boost</option>
+    </select>
+  </div>
+
+  <script>
+    const player = document.getElementById('player');
+    const volumeSlider = document.getElementById('volume');
+    const presetSelect = document.getElementById('preset');
+
+    // Web Audio API
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const source = audioCtx.createMediaElementSource(player);
+    const biquad = audioCtx.createBiquadFilter();
+    biquad.type = "peaking";
+    biquad.frequency.value = 1000;
+    biquad.gain.value = 0;
+
+    source.connect(biquad).connect(audioCtx.destination);
+
+    volumeSlider.oninput = () => {
+      player.volume = volumeSlider.value;
+    };
+
+    presetSelect.onchange = () => {
+      switch(presetSelect.value) {
+        case "pop": biquad.type="peaking"; biquad.frequency.value=3000; biquad.gain.value=4; break;
+        case "rock": biquad.type="lowshelf"; biquad.frequency.value=100; biquad.gain.value=6; break;
+        case "voice": biquad.type="bandpass"; biquad.frequency.value=1000; biquad.gain.value=3; break;
+        case "hiphop": biquad.type="lowshelf"; biquad.frequency.value=80; biquad.gain.value=8; break;
+        case "techno": biquad.type="highshelf"; biquad.frequency.value=8000; biquad.gain.value=5; break;
+        case "dubstep": biquad.type="lowshelf"; biquad.frequency.value=60; biquad.gain.value=10; break;
+        case "bass": biquad.type="lowshelf"; biquad.frequency.value=100; biquad.gain.value=12; break;
+        case "treble": biquad.type="highshelf"; biquad.frequency.value=4000; biquad.gain.value=10; break;
+        default: biquad.gain.value=0; break;
+      }
+    };
+  </script>
+</body>
