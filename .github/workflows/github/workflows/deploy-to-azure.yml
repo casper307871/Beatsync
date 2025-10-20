@@ -1,0 +1,77 @@
+name: Build, Push & Deploy to Azure App Service
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  REGISTRY: yourregistry.azurecr.io     # 👈 your ACR login server (example: myapp.azurecr.io)
+  NAMESPACE: ""                         # optional (leave empty if unused)
+  IMAGE: your-image-name                # 👈 image name (example: weather-bot)
+  TAG: latest
+  APP_SERVICE_NAME: your-app-service    # 👈 Azure Web App name
+  RESOURCE_GROUP: your-resource-group   # 👈 Azure resource group name
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🧾 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: ⚙️ Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 📦 Install dependencies safely
+        run: |
+          if [ -f package-lock.json ]; then
+            echo "Lock file found, running npm ci..."
+            npm ci
+          else
+            echo "No lock file found, running npm install and creating one..."
+            npm install
+            npm i --package-lock-only
+          fi
+
+      - name: 🔐 Log in to Azure Container Registry
+        run: echo "${{ secrets.ACR_PASSWORD }}" | docker login $REGISTRY -u ${{ secrets.ACR_USERNAME }} --password-stdin
+
+      - name: 🔍 Find Dockerfile path
+        id: dockerfile
+        run: |
+          DOCKERFILE_PATH=$(find . -type f -iname "Dockerfile" | head -n 1)
+          if [ -z "$DOCKERFILE_PATH" ]; then
+            echo "❌ No Dockerfile found."
+            exit 1
+          fi
+          echo "✅ Found Dockerfile at: $DOCKERFILE_PATH"
+          echo "path=$DOCKERFILE_PATH" >> $GITHUB_OUTPUT
+
+      - name: 🏗️ Build Docker image
+        run: |
+          docker build -f "${{ steps.dockerfile.outputs.path }}" -t "$REGISTRY/$NAMESPACE/$IMAGE:$TAG" .
+
+      - name: 🚀 Push Docker image to ACR
+        run: |
+          docker push "$REGISTRY/$NAMESPACE/$IMAGE:$TAG"
+
+      - name: 🔓 Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: 🧩 Deploy container to Azure Web App
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ env.APP_SERVICE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE }}:${{ env.TAG }}
+
+      - name: 🔒 Logout
+        run: |
+          docker logout $REGISTRY
+          az logout
