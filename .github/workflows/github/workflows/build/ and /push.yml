@@ -1,0 +1,63 @@
+name: Build and Push to ACR
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  REGISTRY: yourregistry.azurecr.io     # 👈 replace with your ACR login server
+  NAMESPACE: your-namespace             # 👈 optional, or leave empty
+  IMAGE: your-image-name                # 👈 choose your image name
+  TAG: latest
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Ensure Node dependencies are installed correctly
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies safely
+        run: |
+          if [ -f package-lock.json ]; then
+            echo "Lock file found, running npm ci..."
+            npm ci
+          else
+            echo "No lock file found, running npm install and creating one..."
+            npm install
+            npm i --package-lock-only
+          fi
+
+      # Login to Azure Container Registry
+      - name: Log in to ACR
+        run: echo "${{ secrets.ACR_PASSWORD }}" | docker login $REGISTRY -u ${{ secrets.ACR_USERNAME }} --password-stdin
+
+      # Auto-detect Dockerfile location
+      - name: Find Dockerfile path
+        id: dockerfile
+        run: |
+          DOCKERFILE_PATH=$(find . -type f -iname "Dockerfile" | head -n 1)
+          if [ -z "$DOCKERFILE_PATH" ]; then
+            echo "❌ No Dockerfile found in repository."
+            exit 1
+          fi
+          echo "✅ Found Dockerfile at: $DOCKERFILE_PATH"
+          echo "path=$DOCKERFILE_PATH" >> $GITHUB_OUTPUT
+
+      # Build & push Docker image
+      - name: Build and push image to ACR
+        run: |
+          docker build -f "${{ steps.dockerfile.outputs.path }}" -t "$REGISTRY/$NAMESPACE/$IMAGE:$TAG" .
+          docker push "$REGISTRY/$NAMESPACE/$IMAGE:$TAG"
+
+      - name: Logout
+        run: docker logout $REGISTRY
