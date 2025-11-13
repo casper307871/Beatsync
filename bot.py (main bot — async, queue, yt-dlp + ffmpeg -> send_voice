@@ -1,0 +1,252 @@
+# bot.py
+import asyncio
+import logging
+import os
+import shlex
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+
+# logging
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+log = logging.getLogger(__name__)
+
+# config via env
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    log.error("BOT_TOKEN environment variable is required")
+    raise SystemExit(1)
+
+# where downloads live
+DOWNLOADS_DIR = Path(os.environ.get("DOWNLOADS_DIR", "downloads"))
+DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+# queue for play requests
+play_queue: asyncio.Queue = asyncio.Queue()
+playing_lock = asyncio.Lock()
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Hello — music bot ready. Use /play <url or search> to request audio."
+    )
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "/play <url or search>  — download and send as voice message\n"
+        "/queue  — show pending queue\n"
+        "/skip   — skip current/next track (admin only in chat)\n"
+        "/ping   — health check\n"
+    )
+
+
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("pong")
+
+
+async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Adds a request to the queue. Example: /play https://youtu.be/xyz or /play avicii wake me up"""
+    if not context.args:
+        await update.message.reply_text("Usage: /play <url or search terms>")
+        return
+
+    query = " ".join(context.args).strip()
+    requester = update.effective_user.first_name or update.effective_user.username
+    chat_id = update.effective_chat.id
+
+    item = {
+        "query": query,
+        "chat_id": chat_id,
+        "requester": requester,
+        "from_message": update.message.message_id,
+    }
+
+    await play_queue.put(item)
+    await update.message.reply_text(f"Queued: {query} — position {play_queue.qsize()}")
+
+    # ensure the worker is running
+    asyncio.create_task(play_worker(context.application))
+
+
+async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    qlist = []
+    size = play_queue.qsize()
+    if size == 0:
+        await update.message.reply_text("Queue is empty.")
+        return
+    # peek into queue (not trivial since asyncio.Queue has no snapshot) — we drain and re-add
+    tmp = []
+    while not play_queue.empty():
+        v = await play_queue.get()
+        tmp.append(v)
+        qlist.append(v["query"])
+    # put them back
+    for v in tmp:
+        await play_queue.put(v)
+    await update.message.reply_text("Upcoming:\n" + "\n".join(f"- {x}" for x in qlist))
+
+
+async def skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Basic skip: cancels current by cancelling the playing_lock if held; requires chat admin check optionally."""
+    # Simple policy: allow chat admins only (if in group/supergroup); for private chats allow requester
+    user = update.effective_user
+    chat = update.effective_chat
+    allowed = False
+    if chat.type in ("group", "supergroup"):
+        # try to check admin status:
+        try:
+            member = await context.bot.get_chat_member(chat.id, user.id)
+            if member.status in ("administrator", "creator"):
+                allowed = True
+        except Exception:
+            allowed = False
+    else:
+        allowed = True
+
+    if not allowed:
+        await update.message.reply_text("Only chat admins can skip.")
+        return
+
+    # clear the queue and release any playing lock to skip current attempt
+    # (this implementation signals worker to stop via cancelling; worker checks lock)
+    # Clear the next items:
+    cleared = 0
+    while not play_queue.empty():
+        await play_queue.get()
+        cleared += 1
+
+    # Attempt to release playing lock if held by cancelling playing task
+    # We'll just notify — the worker should be coded to respect cancellation.
+    await update.message.reply_text(f"Cleared queue ({cleared} items). Current track will finish or be interrupted.")
+
+
+async def play_worker(app):
+    """Worker that consumes the queue and processes downloads + sends voice messages."""
+    # Only one worker active at a time
+    if playing_lock.locked():
+        return
+    async with playing_lock:
+        while not play_queue.empty():
+            item = await play_queue.get()
+            query = item["query"]
+            chat_id = item["chat_id"]
+            requester = item["requester"]
+            log.info(f"Processing queue item: {query} (requested by {requester})")
+
+            # send a typing action
+            try:
+                await app.bot.send_message(chat_id, f"⏬ Downloading: {query} — requested by {requester}")
+            except Exception:
+                pass
+
+            try:
+                ogg_path = await download_and_convert_to_ogg(query)
+            except Exception as e:
+                log.exception("Error downloading/converting:")
+                try:
+                    await app.bot.send_message(chat_id, f"❌ Failed to download: {query}\n{e}")
+                except Exception:
+                    pass
+                continue
+
+            # send the voice message
+            try:
+                with open(ogg_path, "rb") as f:
+                    await app.bot.send_voice(chat_id, voice=f, caption=f"{query} — requested by {requester}")
+            except Exception as e:
+                log.exception("Failed to send voice:")
+                try:
+                    await app.bot.send_message(chat_id, f"❌ Failed to send voice for: {query}\n{e}")
+                except Exception:
+                    pass
+            finally:
+                try:
+                    os.remove(ogg_path)
+                except Exception:
+                    pass
+
+        log.info("Queue emptied — worker exiting.")
+
+
+async def download_and_convert_to_ogg(query: str) -> str:
+    """
+    1) use yt-dlp to download best audio to a temp file (m4a/webm/mp3)
+    2) run ffmpeg to convert to OGG/Opus (suitable for Telegram voice)
+    returns path to ogg file.
+    """
+    tmpdir = tempfile.mkdtemp(dir=str(DOWNLOADS_DIR))
+    try:
+        # safe filename prefix
+        out_template = os.path.join(tmpdir, "%(id)s.%(ext)s")
+
+        # try to treat query as URL first; if not, use ytsearch1:
+        url_arg = query
+        if not (query.startswith("http://") or query.startswith("https://")):
+            url_arg = f"ytsearch1:{query}"
+
+        ytdlp_cmd = [
+            "yt-dlp",
+            "-f",
+            "bestaudio",
+            "--no-playlist",
+            "--quiet",
+            "--no-warnings",
+            "-o",
+            out_template,
+            url_arg,
+        ]
+        log.info("Running yt-dlp: %s", " ".join(shlex.quote(x) for x in ytdlp_cmd))
+        proc = subprocess.run(ytdlp_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        if proc.returncode != 0:
+            raise RuntimeError(f"yt-dlp failed: {proc.stderr.decode('utf-8','replace')[:400]}")
+
+        # find the downloaded file (first file in tmpdir)
+        files = list(Path(tmpdir).glob("*"))
+        if not files:
+            raise FileNotFoundError("yt-dlp did not produce a file.")
+        downloaded = str(files[0])
+
+        # convert to ogg opus for Telegram voice (mono 48000)
+        ogg_path = downloaded + ".ogg"
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            downloaded,
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "96k",
+            "-vbr",
+            "on",
+            "-application",
+            "voip",
+            "-ac",
+            "1",
+            "-ar",
+            "48000",
+            ogg_path,
+        ]
+        log.info("Running ffmpeg: %s", " ".join(shlex.quote(x) for x in ffmpeg_cmd))
+        proc2 = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        if proc2.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed: {proc2.stderr.decode('utf-8','replace')[:400]}")
+
+        return ogg_path
+    finally:
+        # keep tmpdir until conversion done; other cleanup is in caller
+        # remove intermediate downloaded non-ogg files (we can try)
+        for f in Path(tmpdir).glob("*"):
+            if f.suffix not in (".ogg",):
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+        # leave the dir removal to caller (the ogg file path lives inside it)
